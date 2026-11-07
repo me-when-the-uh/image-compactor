@@ -1,1 +1,68 @@
-*pycache*
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.cache/
+__pypackages__/
+pip-wheel-metadata/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Build and packaging output
+build/
+dist/
+*.egg
+*.egg-info/
+.eggs/
+*.spec
+*.pdb
+*.orig
+*.rej
+
+# Test and coverage output
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+nosetests.xml
+test-results/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.local
+*.code-workspace
+
+# Editors and tooling
+.idea/
+.vscode/
+.vs/
+.history/
+*.swp
+*.swo
+*.suo
+*.user
+*~
+
+# OS metadata and temporary files
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.log
+*.tmp
+*.bak
+*.stackdump
+~$*

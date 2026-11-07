@@ -113,22 +113,20 @@ def decide(
     if downscale == "percent":
         scale = max(0.05, min(1.0, float(percent) / 100.0))
         lines.append(
-            f"Downscale {percent:g}% on each side, {scale * scale * 100:.1f}% of the pixels."
+            f"Scale {percent:g}% on each side, {scale * scale * 100:.1f}% of the pixels."
         )
     elif downscale == "suggested":
         target = backup_target_megapixels(facts.megapixels, phone_class, facts.remosaic)
         if target is None:
-            lines.append(
-                f"{facts.megapixels:.1f} MP, class {phone_class}. Suggested downscale is off."
-            )
+            lines.append(f"{facts.megapixels:.1f} MP. Suggested scale is off.")
         else:
             scale = linear_scale_for_megapixels(facts.megapixels, target)
             lines.append(
-                f"Suggested downscale {facts.megapixels:.1f} MP -> {target:.0f} MP "
+                f"Suggested scale {facts.megapixels:.1f} MP -> {target:.0f} MP "
                 f"({scale * 100:.1f}% on each side)."
             )
     else:
-        lines.append("Resolution stays at the JPEG size.")
+        lines.append("Resolution stays at the source size.")
 
     width = even_dimension(facts.width * scale)
     height = even_dimension(facts.height * scale)

@@ -1,17 +1,25 @@
-"""Read what a phone JPEG actually contains: size, ICC, remosaic flag, gain map."""
+"""Read what an image contains: size, ICC, EXIF, remosaic flag, gain map."""
 
 from __future__ import annotations
 
+import io
 import json
 import re
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from PIL import Image, ExifTags
+from PIL import Image, ExifTags, ImageCms, UnidentifiedImageError
 
 # EXIF ColorSpace: 1 is sRGB, 65535 is uncalibrated.
 EXIF_SRGB = 1
+
+# Phone cameras now write 200 MP frames. Pillow's default guard warns at 89 MP and raises at 178 MP.
+Image.MAX_IMAGE_PIXELS = 500_000_000
+
+SUPPORTED_SUFFIXES = frozenset(
+    {".jpg", ".jpeg", ".jfif", ".png", ".webp", ".tif", ".tiff", ".bmp", ".gif"}
+)
 
 
 @dataclass
@@ -41,6 +49,7 @@ class PhotoFacts:
     gain_map: GainMap | None
     vendor_json: dict[str, str]
     capture_note: str
+    format: str = ""
 
     @property
     def megapixels(self) -> float:
@@ -67,26 +76,30 @@ _SENSOR_NEEDLES = (
 
 def inspect_jpeg(path: Path) -> PhotoFacts:
     path = Path(path)
-    data = path.read_bytes()
-    if data[:2] != b"\xff\xd8":
+    with open(path, "rb") as handle:
+        head = handle.read(2_000_000)
+        more = handle.read(1)
+    if head[:2] != b"\xff\xd8":
         raise ValueError(f"{path}: not a JPEG")
 
-    header_end = _scan_end(data)
-    header = data[:header_end]
+    header_end = _scan_end(head)
+    data = None
+    if header_end >= len(head) and more:
+        data = path.read_bytes()
+        header_end = _scan_end(data)
+    header = (data if data is not None else head)[:header_end]
     icc = _icc_name(header)
-    gain = _gain_map(data, header)
+    gain = None
+    if b"hdrgm:" in header or b'Item:Semantic="GainMap"' in header:
+        if data is None:
+            data = path.read_bytes()
+        gain = _gain_map(data, header)
     note = _capture_note(header)
     hits = _sensor_hits(header)
 
     with Image.open(path) as image:
-        width, height = image.size
-        exif = image.getexif()
-        flat = {ExifTags.TAGS.get(k, str(k)): v for k, v in exif.items()}
-        try:
-            sub = exif.get_ifd(0x8769)
-        except Exception:
-            sub = {}
-        sub_named = {ExifTags.TAGS.get(k, str(k)): v for k, v in sub.items()}
+        width, height = oriented_size(image)
+        flat, sub_named = _exif_rows(image)
 
     def pick(*names):
         for name in names:
@@ -133,7 +146,112 @@ def inspect_jpeg(path: Path) -> PhotoFacts:
         gain_map=gain,
         vendor_json=vendor,
         capture_note=capture[:500],
+        format="JPEG",
     )
+
+
+def inspect_image(path: Path) -> PhotoFacts:
+    """Read a JPEG, PNG, WebP, TIFF, BMP, or GIF. Raise ValueError for anything else."""
+    path = Path(path)
+    if is_jpeg(path):
+        return inspect_jpeg(path)
+    try:
+        with Image.open(path) as image:
+            width, height = oriented_size(image)
+            flat, sub_named = _exif_rows(image)
+            icc = _icc_name_from_bytes(image.info.get("icc_profile", b""))
+            fmt = image.format or path.suffix.lstrip(".").upper()
+    except UnidentifiedImageError as exc:
+        raise ValueError(f"{path}: not a supported image") from exc
+
+    def pick(*names):
+        for name in names:
+            if name in sub_named:
+                return sub_named[name]
+            if name in flat:
+                return flat[name]
+        return None
+
+    color_space = pick("ColorSpace")
+    iso = pick("ISOSpeedRatings", "PhotographicSensitivity")
+    try:
+        iso = int(iso) if iso is not None else None
+    except (TypeError, ValueError):
+        iso = None
+
+    return PhotoFacts(
+        path=path,
+        width=width,
+        height=height,
+        make=_text(pick("Make") or ""),
+        model=_text(pick("Model") or ""),
+        lens=_text(pick("LensModel") or ""),
+        iso=iso,
+        f_number=_float(pick("FNumber")),
+        focal_length_mm=_float(pick("FocalLength")),
+        focal_35mm=_int(pick("FocalLengthIn35mmFilm")),
+        icc_name=icc,
+        exif_color_space=color_space if isinstance(color_space, int) else None,
+        remosaic=False,
+        scene_mode="",
+        sensor_hits=(),
+        gain_map=None,
+        vendor_json={},
+        capture_note="",
+        format=fmt,
+    )
+
+
+def is_jpeg(path: Path) -> bool:
+    with open(path, "rb") as handle:
+        return handle.read(2) == b"\xff\xd8"
+
+
+def oriented_size(image: Image.Image) -> tuple[int, int]:
+    width, height = image.size
+    try:
+        orientation = image.getexif().get(0x0112, 1)
+    except (AttributeError, OSError, SyntaxError, ValueError):
+        orientation = 1
+    if orientation in (5, 6, 7, 8):
+        return height, width
+    return width, height
+
+
+def _exif_rows(image: Image.Image) -> tuple[dict, dict]:
+    try:
+        exif = image.getexif()
+    except (AttributeError, OSError, SyntaxError, ValueError):
+        return {}, {}
+    flat = {ExifTags.TAGS.get(k, str(k)): v for k, v in exif.items()}
+    try:
+        sub = exif.get_ifd(0x8769)
+    except (KeyError, OSError, SyntaxError, ValueError):
+        sub = {}
+    return flat, {ExifTags.TAGS.get(k, str(k)): v for k, v in sub.items()}
+
+
+def _icc_name_from_bytes(icc: bytes) -> str:
+    if not icc:
+        return ""
+    try:
+        profile = ImageCms.ImageCmsProfile(io.BytesIO(icc))
+        name = ImageCms.getProfileDescription(profile).strip("\x00 ")
+    except (ImageCms.PyCMSError, OSError, TypeError, ValueError):
+        name = ""
+    lowered = name.lower()
+    if "display p3" in lowered:
+        return "Display P3"
+    if "srgb" in lowered:
+        return "sRGB"
+    if name:
+        return name[:80]
+    lowered_bytes = icc.lower()
+    if b"display p3" in lowered_bytes:
+        return "Display P3"
+    if b"srgb" in lowered_bytes:
+        return "sRGB"
+    return "ICC"
 
 
 def _scan_end(data: bytes) -> int:

@@ -1,7 +1,8 @@
-"""Run the XL Converter avifenc build. One JPEG in, one AVIF out."""
+"""Run the XL Converter avifenc build. One source image in, one AVIF out."""
 
 from __future__ import annotations
 
+import ctypes
 import os
 import shutil
 import subprocess
@@ -12,6 +13,7 @@ from pathlib import Path
 
 from PIL import Image, ImageOps
 
+from image_compactor.facts import oriented_size
 from image_compactor.suggest import Decision
 
 AVIFENC_CANDIDATES = (
@@ -19,15 +21,74 @@ AVIFENC_CANDIDATES = (
     Path(r"C:\Program Files\XL Converter\_internal\bin\win\libavif\avifenc.exe"),
 )
 
+ENCODER_CREATION_FLAGS = 0
+if os.name == "nt":
+    ENCODER_CREATION_FLAGS = (
+        getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
+        | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    )
+
+_output_lock = threading.Lock()
+
 
 class EncodeError(RuntimeError):
     pass
 
 
+def physical_cores() -> int:
+    if os.name != "nt":
+        return max(1, (os.cpu_count() or 2) // 2)
+    try:
+        return _windows_physical_cores()
+    except (AttributeError, OSError):
+        return max(1, (os.cpu_count() or 2) // 2)
+
+
+def _windows_physical_cores() -> int:
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_info = kernel32.GetLogicalProcessorInformationEx
+    get_info.argtypes = [wintypes.DWORD, ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD)]
+    get_info.restype = wintypes.BOOL
+    length = wintypes.DWORD(0)
+    get_info(0, None, ctypes.byref(length))
+    if not length.value:
+        raise OSError("GetLogicalProcessorInformationEx returned no size")
+    buffer = ctypes.create_string_buffer(length.value)
+    if not get_info(0, ctypes.byref(buffer), ctypes.byref(length)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    offset = 0
+    cores = 0
+    while offset + 8 <= length.value:
+        # RelationProcessorCore is 0.
+        relationship = ctypes.c_uint32.from_buffer(buffer, offset).value
+        size = ctypes.c_uint32.from_buffer(buffer, offset + 4).value
+        if size < 8:
+            break
+        if relationship == 0:
+            cores += 1
+        offset += size
+    return max(1, cores)
+
+
+def encoder_thread_budget() -> int:
+    return max(1, physical_cores() - 1)
+
+
+def worker_plan(jobs: int, budget: int) -> tuple[int, list[int]]:
+    """Concurrent encoders and the thread count for each worker."""
+    jobs = max(1, int(jobs))
+    budget = max(1, int(budget))
+    workers = min(jobs, budget)
+    base, extra = divmod(budget, workers)
+    return workers, [base + (1 if index < extra else 0) for index in range(workers)]
+
+
 def find_avifenc() -> Path:
-    env = os.environ.get("AVIFENC")
+    env = os.environ.get("AVIFENC", "").strip().strip('"')
     if env:
-        path = Path(env)
+        path = Path(os.path.expandvars(env))
         if path.is_file():
             return path
         raise EncodeError(f"AVIFENC is set to {env}, and that file is not there")
@@ -38,7 +99,7 @@ def find_avifenc() -> Path:
     if found:
         return Path(found)
     raise EncodeError(
-        "avifenc.exe was not found. Install XL Converter, or set AVIFENC to avifenc.exe."
+        "avifenc.exe was not found. Install XL Converter, set AVIFENC, or choose the encoder in the window."
     )
 
 
@@ -48,7 +109,8 @@ def avifenc_command(
     dest: Path,
     decision: Decision,
     *,
-    resized: bool,
+    threads: int,
+    png_input: bool,
     exif_path: Path | None,
 ) -> list[str]:
     command = [
@@ -66,15 +128,15 @@ def avifenc_command(
         "-r",
         "full",
         "-j",
-        "all",
+        str(max(1, int(threads))),
         # Still-picture tune used by XL Converter's SVT path. This build is SVT-AV1 3.0.2.
         "-a",
         "tune=4",
     ]
     if decision.cicp:
         command += ["--cicp", decision.cicp]
-    if resized:
-        # Direct JPEG copies skip the RGB round trip. A resized PNG does not.
+    if png_input:
+        # A resized JPEG and every converted format pass through an RGB PNG.
         command.append("--sharpyuv")
     if decision.drop_xmp:
         command.append("--ignore-xmp")
@@ -101,119 +163,151 @@ def unique_output(directory: Path, stem: str) -> Path:
 class EncodeResult:
     output: Path
     command: list[str]
+    bytes_in: int
     bytes_out: int
     log: str
 
 
-def encode_jpeg(
+def encode_image(
     source: Path,
     dest_dir: Path,
     decision: Decision,
     *,
     avifenc: Path | None = None,
+    threads: int | None = None,
     cancel: threading.Event | None = None,
 ) -> EncodeResult:
     avifenc = avifenc or find_avifenc()
-    dest = unique_output(dest_dir, Path(source).stem)
-    with tempfile.TemporaryDirectory(prefix="image-compactor-") as temp_name:
-        temp = Path(temp_name)
-        encoder_input, resized, exif_path = _prepare(Path(source), temp, decision)
-        command = avifenc_command(
-            avifenc,
-            encoder_input,
-            dest,
-            decision,
-            resized=resized,
-            exif_path=exif_path,
+    source = Path(source)
+    dest_dir = Path(dest_dir)
+    limit = encoder_thread_budget()
+    threads = limit if threads is None else min(limit, max(1, int(threads)))
+    if decision.width < 2 or decision.height < 2:
+        raise EncodeError(
+            f"{source.name}: output size {decision.width} x {decision.height} is too small"
         )
-        if cancel is not None and cancel.is_set():
-            raise EncodeError(f"Stopped before {source.name}")
-        proc = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        while proc.poll() is None:
-            if cancel is not None and cancel.is_set():
+    if cancel is not None and cancel.is_set():
+        raise EncodeError(f"Stopped before {source.name}")
+
+    source_stat = source.stat()
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    handle, temp_name = tempfile.mkstemp(
+        prefix=f".{source.stem}-", suffix=".avif", dir=dest_dir
+    )
+    os.close(handle)
+    temp_output = Path(temp_name)
+    try:
+        with tempfile.TemporaryDirectory(prefix="image-compactor-") as work_name:
+            work = Path(work_name)
+            encoder_input, png_input, exif_path = _prepare(source, work, decision)
+            command = avifenc_command(
+                avifenc,
+                encoder_input,
+                temp_output,
+                decision,
+                threads=threads,
+                png_input=png_input,
+                exif_path=exif_path,
+            )
+            proc = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=ENCODER_CREATION_FLAGS,
+            )
+            captured: dict[str, str] = {}
+
+            def collect() -> None:
+                captured["stdout"], captured["stderr"] = proc.communicate()
+
+            # Drain both pipes while the process runs. A full pipe blocks avifenc.
+            reader = threading.Thread(target=collect, daemon=True)
+            reader.start()
+            while proc.poll() is None:
+                if cancel is not None and cancel.is_set():
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+                    break
                 try:
-                    proc.kill()
-                except OSError:
+                    proc.wait(timeout=0.25)
+                except subprocess.TimeoutExpired:
                     pass
-                break
-            try:
-                proc.wait(timeout=0.25)
-            except subprocess.TimeoutExpired:
-                pass
-        stdout, stderr = proc.communicate()
-        log = (stdout or "") + (stderr or "")
-        stopped = cancel is not None and cancel.is_set() and proc.returncode != 0
-        failed = proc.returncode != 0 or not dest.is_file() or dest.stat().st_size == 0
-        if stopped or failed:
-            if dest.is_file():
-                dest.unlink()
+            reader.join()
+            log = (captured.get("stdout") or "") + (captured.get("stderr") or "")
+            stopped = cancel is not None and cancel.is_set() and proc.returncode != 0
+            failed = (
+                proc.returncode != 0
+                or not temp_output.is_file()
+                or temp_output.stat().st_size == 0
+            )
             if stopped:
                 raise EncodeError(f"Stopped during {source.name}")
-            raise EncodeError(
-                f"avifenc failed on {source.name} (exit {proc.returncode})\n{log[-2000:]}"
-            )
-        _copy_file_times(Path(source), dest)
+            if failed:
+                raise EncodeError(
+                    f"avifenc failed on {source.name} (exit {proc.returncode})\n{log[-2000:]}"
+                )
+        with _output_lock:
+            dest = unique_output(dest_dir, source.stem)
+            os.replace(temp_output, dest)
+        _copy_file_times(source_stat, dest)
         return EncodeResult(
             output=dest,
             command=command,
+            bytes_in=source_stat.st_size,
             bytes_out=dest.stat().st_size,
             log=log,
         )
+    finally:
+        temp_output.unlink(missing_ok=True)
 
 
-def _prepare(source: Path, temp: Path, decision: Decision) -> tuple[Path, bool, Path | None]:
-    needs_resize = decision.width != 0 and (
-        decision.scale < 0.999 or decision.width * decision.height < _jpeg_pixels(source)
-    )
-    # scale 1 keeps the JPEG bytes on the avifenc direct-copy path.
-    if not needs_resize:
-        return source, False, None
+def _prepare(source: Path, work: Path, decision: Decision) -> tuple[Path, bool, Path | None]:
+    target = (decision.width, decision.height)
+    with Image.open(source) as opened:
+        direct = (
+            opened.format in ("JPEG", "MPO")
+            and opened.mode in ("RGB", "L")
+            and oriented_size(opened) == target
+        )
+        if direct:
+            return source, False, None
+        icc = opened.info.get("icc_profile")
+        has_alpha = opened.mode in ("RGBA", "LA") or "transparency" in opened.info
+        image = ImageOps.exif_transpose(opened)
+        if image.size != target:
+            image = image.resize(target, Image.Resampling.LANCZOS)
+        prepared = image.convert("RGBA" if has_alpha else "RGB")
+        png_path = work / "prepared.png"
+        save_kwargs = {}
+        if icc:
+            save_kwargs["icc_profile"] = icc
+        prepared.save(png_path, **save_kwargs)
+        exif_path = _exif_sidecar(image, work)
+        return png_path, True, exif_path
 
-    image = Image.open(source)
-    image = ImageOps.exif_transpose(image)
-    icc = image.info.get("icc_profile")
-    resized = image.convert("RGB").resize(
-        (decision.width, decision.height),
-        Image.Resampling.LANCZOS,
-    )
-    png_path = temp / "resized.png"
-    save_kwargs = {}
-    if icc:
-        save_kwargs["icc_profile"] = icc
-    resized.save(png_path, **save_kwargs)
 
-    exif_path = _exif_sidecar(image, temp)
-    return png_path, True, exif_path
-
-
-def _copy_file_times(source: Path, dest: Path) -> None:
+def _copy_file_times(source_stat: os.stat_result, dest: Path) -> None:
     # Date modified is the filesystem time galleries use when EXIF is ignored.
-    stat = source.stat()
-    os.utime(dest, (stat.st_atime, stat.st_mtime))
+    os.utime(dest, (source_stat.st_atime, source_stat.st_mtime))
 
 
-def _jpeg_pixels(source: Path) -> int:
-    with Image.open(source) as image:
-        return image.size[0] * image.size[1]
-
-
-def _exif_sidecar(image: Image.Image, temp: Path) -> Path | None:
+def _exif_sidecar(image: Image.Image, work: Path) -> Path | None:
     try:
         exif = image.getexif()
+        if not exif:
+            return None
         # Orientation is already applied by exif_transpose.
         exif[0x0112] = 1
         payload = exif.tobytes()
-    except Exception:
+    except (AttributeError, OSError, SyntaxError, TypeError, ValueError):
         return None
     if not payload:
         return None
-    path = temp / "exif.bin"
+    path = work / "exif.bin"
     path.write_bytes(payload)
     return path
