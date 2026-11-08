@@ -25,11 +25,16 @@ dist/
 *.egg-info/
 .eggs/
 *.spec
+!image-compactor.spec
 *.pdb
 *.orig
 *.rej
 
+# Built encoder cache
+build/encoder/avifenc.exe
+
 # Test and coverage output
+tests/
 .coverage
 .coverage.*
 coverage.xml

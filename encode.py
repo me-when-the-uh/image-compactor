@@ -1,4 +1,4 @@
-"""Run the XL Converter avifenc build. One source image in, one AVIF out."""
+"""Run avifenc. One source image in, one AVIF out."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import ctypes
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 from dataclasses import dataclass
@@ -85,7 +86,24 @@ def worker_plan(jobs: int, budget: int) -> tuple[int, list[int]]:
     return workers, [base + (1 if index < extra else 0) for index in range(workers)]
 
 
+def _bundled_avifenc() -> Path | None:
+    if not getattr(sys, "frozen", False):
+        return None
+    base = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    for candidate in (
+        base / "avifenc" / "avifenc.exe",
+        Path(sys.executable).parent / "avifenc" / "avifenc.exe",
+    ):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def find_avifenc() -> Path:
+    # The frozen app carries its own encoder. Source runs may use AVIFENC or XL Converter.
+    bundled = _bundled_avifenc()
+    if bundled is not None:
+        return bundled
     env = os.environ.get("AVIFENC", "").strip().strip('"')
     if env:
         path = Path(os.path.expandvars(env))
@@ -99,7 +117,8 @@ def find_avifenc() -> Path:
     if found:
         return Path(found)
     raise EncodeError(
-        "avifenc.exe was not found. Install XL Converter, set AVIFENC, or choose the encoder in the window."
+        "avifenc.exe was not found. The build should include one in the avifenc folder. "
+        "Set AVIFENC or choose the encoder in the window."
     )
 
 
@@ -159,6 +178,14 @@ def unique_output(directory: Path, stem: str) -> Path:
         index += 1
 
 
+def output_path(directory: Path, stem: str, overwrite: bool = False) -> Path:
+    """Plain name when overwrite is on, otherwise the next free name."""
+    directory.mkdir(parents=True, exist_ok=True)
+    if overwrite:
+        return directory / f"{stem}.avif"
+    return unique_output(directory, stem)
+
+
 @dataclass
 class EncodeResult:
     output: Path
@@ -175,6 +202,7 @@ def encode_image(
     *,
     avifenc: Path | None = None,
     threads: int | None = None,
+    overwrite: bool = False,
     cancel: threading.Event | None = None,
 ) -> EncodeResult:
     avifenc = avifenc or find_avifenc()
@@ -252,7 +280,7 @@ def encode_image(
                     f"avifenc failed on {source.name} (exit {proc.returncode})\n{log[-2000:]}"
                 )
         with _output_lock:
-            dest = unique_output(dest_dir, source.stem)
+            dest = output_path(dest_dir, source.stem, overwrite)
             os.replace(temp_output, dest)
         _copy_file_times(source_stat, dest)
         return EncodeResult(

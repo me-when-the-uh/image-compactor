@@ -25,8 +25,8 @@ class ProfileDefaults:
 
 
 PROFILES = {
-    KEEP: ProfileDefaults(KEEP, speed=4, quality=45, bit_depth=10, downscale="off"),
-    BACKUP: ProfileDefaults(BACKUP, speed=5, quality=35, bit_depth=8, downscale="suggested"),
+    KEEP: ProfileDefaults(KEEP, speed=3, quality=45, bit_depth=10, downscale="off"),
+    BACKUP: ProfileDefaults(BACKUP, speed=4, quality=35, bit_depth=8, downscale="suggested"),
 }
 
 
